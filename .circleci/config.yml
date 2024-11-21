@@ -1,31 +1,68 @@
-# Use the latest 2.1 version of CircleCI pipeline process engine.
-# See: https://circleci.com/docs/configuration-reference
 version: 2.1
 
-# Define a job to be invoked later in a workflow.
-# See: https://circleci.com/docs/jobs-steps/#jobs-overview & https://circleci.com/docs/configuration-reference/#jobs
+orbs:
+  aws-ecr: circleci/aws-ecr@9.0.1
+  jq: circleci/jq@3.0.0
+
 jobs:
-  say-hello:
-    # Specify the execution environment. You can specify an image from Docker Hub or use one of our convenience images from CircleCI's Developer Hub.
-    # See: https://circleci.com/docs/executor-intro/ & https://circleci.com/docs/configuration-reference/#executor-job
-    docker:
-      # Specify the version you desire here
-      # See: https://circleci.com/developer/images/image/cimg/base
-      - image: cimg/base:current
+  Pulling VB Image And Initiating SBOM Scan:
+    machine:
+      image: ubuntu-2004:current
+    environment:
+      VB_API_URL: "https://app.stage.veribom.com"
+      VB_IMAGE_NAME: "veribom-scanner:latest"
+      VB_SCANCODE_DEBUG_PACKAGE_GRADLE: "True"
+      VB_SCAN_LICENSE: "False"
+      VB_DEBUG: "True"
+      VB_SCAN_TYPE: "DIRECTORY"
+      VB_DIRECTORY_PATH: "/checkout"
 
-    # Add steps to the job
-    # See: https://circleci.com/docs/jobs-steps/#steps-overview & https://circleci.com/docs/configuration-reference/#steps
     steps:
-      # Checkout the code as the first step.
       - checkout
-      - run:
-          name: "Say hello"
-          command: "echo Hello, World!"
 
-# Orchestrate jobs using workflows
-# See: https://circleci.com/docs/workflows/ & https://circleci.com/docs/configuration-reference/#workflows
+      - jq/install:
+          version: jq-1.7
+
+      - run:
+          name: Fetching VB Token
+          command: echo 'VB_ENCODED_TOKEN=`curl --location "${VB_API_URL}/utilityapi/v1/registry?api_key=${VB_API_KEY}" 2>/dev/null | jq -r .data`' >> $BASH_ENV
+
+      - run:
+          name: Decoding VB Token
+          command: echo 'VB_DECODED_JSON=`echo ${VB_ENCODED_TOKEN} | base64 -d`' >> "$BASH_ENV"
+
+      - run:
+          name: 'Exporting VB Environment Variables'
+          command: |
+              echo 'VB_USERNAME=`echo ${VB_DECODED_JSON} | jq -r .username`' >> "$BASH_ENV"
+              echo 'VB_PASSWORD=`echo ${VB_DECODED_JSON} | jq -r .password`'  >> "$BASH_ENV"
+              echo 'VB_REGISTRY_ID=`echo ${VB_DECODED_JSON} | jq -r .registry_id`'  >> "$BASH_ENV"
+              echo 'VB_REGION=`echo ${VB_DECODED_JSON} | jq -r .region`' >> "$BASH_ENV"
+
+      - run:
+          name: Logging Into VB
+          command: echo "${VB_PASSWORD}" | docker login -u ${VB_USERNAME} ${VB_REGISTRY_ID}.dkr.ecr.${VB_REGION}.amazonaws.com --password-stdin
+
+      - run:
+          name: Pulling VB Image
+          command: docker pull ${VB_REGISTRY_ID}.dkr.ecr.${VB_REGION}.amazonaws.com/${VB_IMAGE_NAME}
+
+      - run:
+          name: Initiating SBOM Scan
+          command: |
+            VB_CREATE_SCAN_HEADER_PARAM="Content-Type: application/json"
+            VB_CREATE_SCAN_DATA_PARAM="{\"api_key\": \"$VB_API_KEY\"}"
+            VB_SCAN_ID=`curl --location "${VB_API_URL}/utilityapi/v1/scan" --header "$VB_CREATE_SCAN_HEADER_PARAM" --data "$VB_CREATE_SCAN_DATA_PARAM" 2>/dev/null | jq -r .data.scan_id`
+            echo "export VB_SCAN_ID=${VB_SCAN_ID}" >> "$BASH_ENV"
+
+      - run:
+          name: Running VB Image
+          command: docker run -v /home/circleci/project:${VB_DIRECTORY_PATH} -e API_URL=${VB_API_URL} -e SCANCODE_DEBUG_PACKAGE_GRADLE=${VB_SCANCODE_DEBUG_PACKAGE_GRADLE} -e SCAN_LICENSE=${VB_SCAN_LICENSE}  -e SCAN_ID=${VB_SCAN_ID} -e SCAN_TYPE=${VB_SCAN_TYPE} -e DIRECTORY_PATH=${VB_DIRECTORY_PATH} -e API_KEY=${VB_API_KEY} ${VB_REGISTRY_ID}.dkr.ecr.${VB_REGION}.amazonaws.com/${VB_IMAGE_NAME} run_scanner
+      - run:
+          name: VB Scanning Completed
+          command: echo "VB Scanning Completed"
+
 workflows:
-  say-hello-workflow: # This is the name of the workflow, feel free to change it to better match your workflow.
-    # Inside the workflow, you define the jobs you want to run.
+  pull-and-run-workflow:
     jobs:
-      - say-hello
+      - Pulling VB Image And Initiating SBOM Scan
